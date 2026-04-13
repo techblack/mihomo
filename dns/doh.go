@@ -2,13 +2,11 @@ package dns
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"runtime"
 	"strconv"
@@ -18,11 +16,13 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+
+	"github.com/metacubex/http"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/tls"
 	D "github.com/miekg/dns"
 	"golang.org/x/exp/slices"
-	"golang.org/x/net/http2"
 )
 
 // Values to configure HTTP and HTTP/2 transport.
@@ -36,13 +36,14 @@ const (
 	transportDefaultIdleConnTimeout = 5 * time.Minute
 
 	// dohMaxConnsPerHost controls the maximum number of connections for
-	// each host.
-	dohMaxConnsPerHost = 1
+	// each host.  Note, that setting it to 1 may cause issues with Go's http
+	// implementation, see https://github.com/AdguardTeam/dnsproxy/issues/278.
+	dohMaxConnsPerHost = 2
 	dialTimeout        = 10 * time.Second
 
 	// dohMaxIdleConns controls the maximum number of connections being idle
 	// at the same time.
-	dohMaxIdleConns = 1
+	dohMaxIdleConns = 2
 	maxElapsedTime  = time.Second * 30
 )
 
@@ -174,11 +175,23 @@ func (doh *dnsOverHTTPS) Close() (err error) {
 	return doh.closeClient(doh.client)
 }
 
-// closeClient cleans up resources used by client if necessary.  Note, that at
-// this point it should only be done for HTTP/3 as it may leak due to keep-alive
-// connections.
+func (doh *dnsOverHTTPS) ResetConnection() {
+	doh.clientMu.Lock()
+	defer doh.clientMu.Unlock()
+
+	if doh.client == nil {
+		return
+	}
+
+	_ = doh.closeClient(doh.client)
+	doh.client = nil
+}
+
+// closeClient cleans up resources used by client if necessary.
 func (doh *dnsOverHTTPS) closeClient(client *http.Client) (err error) {
-	if isHTTP3(client) {
+	client.CloseIdleConnections()
+
+	if isHTTP3(client) { // HTTP/3 may leak due to keep-alive connections.
 		return client.Transport.(io.Closer).Close()
 	}
 
@@ -382,12 +395,16 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 		return transport, nil
 	}
 
-	tlsConfig := ca.GetGlobalTLSConfig(
-		&tls.Config{
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{
+		TLSConfig: &tls.Config{
 			InsecureSkipVerify:     doh.skipCertVerify,
 			MinVersion:             tls.VersionTLS12,
 			SessionTicketsDisabled: false,
-		})
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
 	var nextProtos []string
 	for _, v := range doh.httpVersions {
 		nextProtos = append(nextProtos, string(v))
@@ -420,8 +437,8 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 	// Explicitly configure transport to use HTTP/2.
 	//
 	// See https://github.com/AdguardTeam/dnsproxy/issues/11.
-	var transportH2 *http2.Transport
-	transportH2, err = http2.ConfigureTransports(transport)
+	var transportH2 *http.Http2Transport
+	transportH2, err = http.Http2ConfigureTransports(transport)
 	if err != nil {
 		return nil, err
 	}
@@ -432,12 +449,12 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 	return transport, nil
 }
 
-// http3Transport is a wrapper over *http3.RoundTripper that tries to optimize
+// http3Transport is a wrapper over *http3.Transport that tries to optimize
 // its behavior.  The main thing that it does is trying to force use a single
 // connection to a host instead of creating a new one all the time.  It also
 // helps mitigate race issues with quic-go.
 type http3Transport struct {
-	baseTransport *http3.RoundTripper
+	baseTransport *http3.Transport
 
 	closed bool
 	mu     sync.RWMutex
@@ -479,11 +496,18 @@ func (h *http3Transport) Close() (err error) {
 	return h.baseTransport.Close()
 }
 
+func (h *http3Transport) CloseIdleConnections() {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	h.baseTransport.CloseIdleConnections()
+}
+
 // createTransportH3 tries to create an HTTP/3 transport for this upstream.
 // We should be able to fall back to H1/H2 in case if HTTP/3 is unavailable or
 // if it is too slow.  In order to do that, this method will run two probes
 // in parallel (one for TLS, the other one for QUIC) and if QUIC is faster it
-// will create the *http3.RoundTripper instance.
+// will create the *http3.Transport instance.
 func (doh *dnsOverHTTPS) createTransportH3(
 	ctx context.Context,
 	tlsConfig *tls.Config,
@@ -497,7 +521,7 @@ func (doh *dnsOverHTTPS) createTransportH3(
 		return nil, err
 	}
 
-	rt := &http3.RoundTripper{
+	rt := &http3.Transport{
 		Dial: func(
 			ctx context.Context,
 
@@ -506,7 +530,7 @@ func (doh *dnsOverHTTPS) createTransportH3(
 			_ string,
 			tlsCfg *tls.Config,
 			cfg *quic.Config,
-		) (c quic.EarlyConnection, err error) {
+		) (c *quic.Conn, err error) {
 			return doh.dialQuic(ctx, addr, tlsCfg, cfg)
 		},
 		DisableCompression: true,
@@ -517,7 +541,7 @@ func (doh *dnsOverHTTPS) createTransportH3(
 	return &http3Transport{baseTransport: rt}, nil
 }
 
-func (doh *dnsOverHTTPS) dialQuic(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+func (doh *dnsOverHTTPS) dialQuic(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 	ip, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -701,14 +725,10 @@ func (doh *dnsOverHTTPS) tlsDial(ctx context.Context, network string, config *tl
 	// TLS handshake dialTimeout will be used as connection deadLine.
 	conn := tls.Client(rawConn, config)
 
-	err = conn.SetDeadline(time.Now().Add(dialTimeout))
-	if err != nil {
-		// Must not happen in normal circumstances.
-		log.Errorln("cannot set deadline: %v", err)
-		return nil, err
-	}
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
 
-	err = conn.Handshake()
+	err = conn.HandshakeContext(ctx)
 	if err != nil {
 		defer conn.Close()
 		return nil, err
